@@ -81,3 +81,11 @@ def get_fx_rate(from_currency: str, to_currency: str) -> float:
         raise MarketDataError(
             f"Failed to fetch FX rate {from_currency}->{to_currency}: {e}"
         )
+
+
+
+def is_etf(symbol: str) -> bool:
+    t = yf.Ticker(symbol)
+    info = t.get_info()
+    return info.get("quoteType") == "ETF"
+
