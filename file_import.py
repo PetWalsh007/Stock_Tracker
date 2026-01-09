@@ -157,7 +157,7 @@ def _classify_action(action: str):
 
 
 
-def main():
+def _main():
     path = "T212_2501-2512.csv"  # change if needed
     rows = ingest_trading212_csv(path)
 
@@ -184,4 +184,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    _main()

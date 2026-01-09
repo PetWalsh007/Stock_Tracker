@@ -89,3 +89,17 @@ def is_etf(symbol: str) -> bool:
     info = t.get_info()
     return info.get("quoteType") == "ETF"
 
+def get_split_data(symbol: str, date: str = "") -> dict:
+    """
+    Get split data for a given ticker symbol.
+    
+    """
+    t = yf.Ticker(symbol)
+    splits = t.splits  
+
+    if date != "":
+        # Filter splits for splits after or on the given date
+        splits = splits[splits.index >= date]
+
+    return splits
+

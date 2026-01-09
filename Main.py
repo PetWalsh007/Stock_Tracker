@@ -3,10 +3,12 @@ from datetime import datetime
 from positions import Position
 from market_data import get_price, get_currency, get_fx_rate
 
+from file_import import ingest_trading212_csv, _main as import_main
+
 def d(s: str):
     return datetime.strptime(s, "%d/%m/%Y")
 
-def build_positions():
+def dev_build_pos():
 
     positions = {}
 
@@ -75,8 +77,8 @@ def print_sale_details(position: Position):
         print(f"  Cost left €: {position.total_cost_left():.2f}")
 
 
-def main():
-    positions = build_positions()
+def dev_test():
+    positions = dev_build_pos()
 
     # Print NVDA sale breakdown
     nvda = positions["NVDA"]
@@ -108,5 +110,16 @@ def main():
     print(f"ROI: {roi:.2f}%")
 
 
+
+
+
+def main():
+    
+
+    dev_test()
+
+    
+
+    pass
 if __name__ == "__main__":
     main()
