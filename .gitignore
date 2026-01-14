@@ -235,3 +235,5 @@ __marimo__/
 *.txt
 
 notes/
+t212_exports/
+credentials/
