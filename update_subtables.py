@@ -190,7 +190,7 @@ def populate_sales(db) -> Dict[str, int]:
     return {"sales_seen": seen, "sales_inserted": inserted}
 
 
-def main():
+def run():
     with open("credentials/db_config.json", "r", encoding="utf-8") as f:
         db_config = json.load(f)
 
@@ -220,6 +220,10 @@ def main():
 
     print("Populate complete:", {**lots_stats, **sales_stats})
 
+
+
+def main():
+    run()
 
 if __name__ == "__main__":
     main()
