@@ -3,13 +3,23 @@ import json
 import hashlib
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple, Set, Callable
 
 from db_con import connectcls_postgres  
 
 
 # ----------------------------
 # CONFIG
+
+REQUIRED_TABLES = {
+    "broker_trades",
+    "import_runs",
+    "corporate_actions",
+    "lots",
+    "sales",
+    "sale_lot_usage",
+}
+
 
 IMPORT_DIR = Path("./t212_exports")              # folder of CSV exports
 STATE_JSON_PATH = Path("credentials/t212_import_state.json")
@@ -52,6 +62,189 @@ H_FTT_CCY = "Currency (French transaction tax)"
 
 
 # ----------------------------
+
+
+def get_public_tables(db) -> Set[str]:
+    db.cursor.execute("""
+        SELECT tablename
+        FROM pg_tables
+        WHERE schemaname = 'public'
+        ORDER BY tablename;
+    """)
+    return {r[0] for r in db.cursor.fetchall()}
+
+
+def exec_ddl(db, sql: str) -> None:
+    db.cursor.execute(sql)
+
+
+
+def create_import_runs(db) -> None:
+    exec_ddl(db, """
+    CREATE TABLE IF NOT EXISTS public.import_runs (
+      run_id BIGSERIAL PRIMARY KEY,
+      run_time TIMESTAMP NOT NULL DEFAULT NOW(),
+      state JSONB NOT NULL
+    );
+    """)
+    exec_ddl(db, """
+    CREATE INDEX IF NOT EXISTS idx_import_runs_run_time
+    ON public.import_runs (run_time DESC);
+    """)
+
+
+def create_corporate_actions(db) -> None:
+    exec_ddl(db, """
+    CREATE TABLE IF NOT EXISTS public.corporate_actions (
+      action_id BIGSERIAL PRIMARY KEY,
+      instrument_key TEXT NOT NULL,
+      action_type TEXT NOT NULL,          -- 'SPLIT'
+      effective_date DATE NOT NULL,
+      factor DOUBLE PRECISION NOT NULL,
+      source TEXT,
+      source_payload JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (instrument_key, action_type, effective_date, factor)
+    );
+    """)
+    exec_ddl(db, """
+    CREATE INDEX IF NOT EXISTS idx_corp_actions_instr_date
+      ON public.corporate_actions (instrument_key, effective_date);
+    """)
+
+
+def create_lots(db) -> None:
+    exec_ddl(db, """
+    CREATE TABLE IF NOT EXISTS public.lots (
+      lot_id BIGSERIAL PRIMARY KEY,
+
+      instrument_key TEXT NOT NULL,
+
+      -- links to raw buy row when it exists (can be NULL for synthetic/opening lots if you ever allow them)
+      buy_trade_id BIGINT,
+
+      buy_time TIMESTAMP NOT NULL,
+
+      original_qty DOUBLE PRECISION NOT NULL,
+      total_cost_eur DOUBLE PRECISION NOT NULL,
+
+      split_factor DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+      adjusted_qty DOUBLE PRECISION NOT NULL,
+      qty_sold DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+      qty_left DOUBLE PRECISION NOT NULL,
+      cost_left_eur DOUBLE PRECISION NOT NULL,
+      adjusted_cost_per_share_eur DOUBLE PRECISION NOT NULL,
+
+      fully_sold BOOLEAN NOT NULL DEFAULT FALSE,
+      lot_source TEXT NOT NULL DEFAULT 'BUY',  -- BUY / CORP_ACTION / OPENING etc
+
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ
+    );
+    """)
+    exec_ddl(db, """CREATE UNIQUE INDEX IF NOT EXISTS ux_lots_buy_trade_id
+ON public.lots (buy_trade_id);
+    """)
+    exec_ddl(db, """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_lots_buy_trade_id
+    ON public.lots(buy_trade_id)
+    WHERE buy_trade_id IS NOT NULL;
+    """)
+    exec_ddl(db, """
+    CREATE INDEX IF NOT EXISTS idx_lots_instr_buy_time
+    ON public.lots(instrument_key, buy_time);
+    """)
+    exec_ddl(db, """
+    CREATE INDEX IF NOT EXISTS idx_lots_open
+    ON public.lots(instrument_key, fully_sold, buy_time);
+    """)
+
+    
+    
+    exec_ddl(db, """
+    ALTER TABLE public.lots
+    ADD CONSTRAINT lots_buy_trade_id_fkey
+     FOREIGN KEY (buy_trade_id) REFERENCES public.broker_trades(trade_id);
+    """)
+
+
+
+def create_sales(db) -> None:
+    exec_ddl(db, """
+    CREATE TABLE IF NOT EXISTS public.sales (
+      sale_id BIGSERIAL PRIMARY KEY,
+
+      instrument_key TEXT NOT NULL,
+
+      sell_trade_id BIGINT NOT NULL,
+      sell_time TIMESTAMP NOT NULL,
+
+      quantity_sold DOUBLE PRECISION NOT NULL,
+      proceeds_eur DOUBLE PRECISION NOT NULL,
+
+      fifo_cost_eur DOUBLE PRECISION,
+      fifo_gain_eur DOUBLE PRECISION,
+
+      processed BOOLEAN NOT NULL DEFAULT FALSE,
+      processed_at TIMESTAMPTZ,
+      used_synthetic_lot BOOLEAN NOT NULL DEFAULT FALSE,
+
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ,
+
+      UNIQUE (sell_trade_id)
+    );
+    """)
+    exec_ddl(db, """CREATE UNIQUE INDEX IF NOT EXISTS ux_sales_sell_trade_id
+ON public.sales (sell_trade_id);
+    """)
+    exec_ddl(db, """
+    CREATE INDEX IF NOT EXISTS idx_sales_instr_time
+    ON public.sales(instrument_key, sell_time);
+    """)
+    exec_ddl(db, """
+    CREATE INDEX IF NOT EXISTS idx_sales_processed
+    ON public.sales(processed, sell_time);
+    """)
+
+
+
+def create_sale_lot_usage(db) -> None:
+    exec_ddl(db, """
+    CREATE TABLE IF NOT EXISTS public.sale_lot_usage (
+      usage_id BIGSERIAL PRIMARY KEY,
+      sale_id BIGINT NOT NULL,
+      lot_id BIGINT NOT NULL,
+      qty_used DOUBLE PRECISION NOT NULL,
+      cost_used_eur DOUBLE PRECISION NOT NULL,
+      proceeds_eur DOUBLE PRECISION NOT NULL,
+      gain_eur DOUBLE PRECISION NOT NULL,
+
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+      UNIQUE (sale_id, lot_id)
+    );
+    """)
+    exec_ddl(db, """
+    CREATE INDEX IF NOT EXISTS idx_usage_sale
+    ON public.sale_lot_usage(sale_id);
+    """)
+    exec_ddl(db, """
+    CREATE INDEX IF NOT EXISTS idx_usage_lot
+    ON public.sale_lot_usage(lot_id);
+    """)
+
+    
+    exec_ddl(db, """
+    ALTER TABLE public.sale_lot_usage
+    ADD CONSTRAINT fk_usage_sale FOREIGN KEY (sale_id) REFERENCES public.sales(sale_id);
+    """)
+    exec_ddl(db, """
+    ALTER TABLE public.sale_lot_usage
+    ADD CONSTRAINT fk_usage_lot FOREIGN KEY (lot_id) REFERENCES public.lots(lot_id);
+    """)
+
+
 
 def parse_float(x: Any) -> Optional[float]:
     if x is None:
@@ -96,8 +289,55 @@ def make_synth_key(action: str, trade_time: datetime, isin: Optional[str], ticke
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
+def ensure_database(db) -> None:
+    """
+    Ensures required tables exist in the correct order.
+    - Creates only missing tables (once)
+    - Enforces dependency order (sales before sale_lot_usage, etc)
+    - Throws if broker_trades is missing (ground truth)
+    """
+    tables = get_public_tables(db)
 
-def ensure_schema(db):
+    # broker_trades must exist (ground truth)
+    if "broker_trades" not in tables:
+        raise RuntimeError(
+            "broker_trades is missing. Create/import that first, since it's the ground truth."
+        )
+
+    missing = REQUIRED_TABLES - tables
+    if not missing:
+        print("[ensure_database] ok (nothing to create)")
+        return
+
+    creators: Dict[str, Callable] = {
+        "import_runs": create_import_runs,
+        "corporate_actions": create_corporate_actions,
+        "lots": create_lots,
+        "sales": create_sales,
+        "sale_lot_usage": create_sale_lot_usage,
+    }
+
+    # Create missing tables in dependency-safe order
+    create_order = [
+        "import_runs",
+        "corporate_actions",
+        "lots",
+        "sales",
+        "sale_lot_usage",
+    ]
+
+    for name in create_order:
+        if name in missing:
+            print(f"[ensure_database] creating missing table: {name}")
+            creators[name](db)
+
+    db.conn.commit()
+    print("[ensure_database] ok")
+
+
+
+
+def ensure_schema_main(db):
     db.cursor.execute("""
     CREATE TABLE IF NOT EXISTS public.broker_trades (
       trade_id BIGSERIAL PRIMARY KEY,
@@ -307,7 +547,7 @@ def save_state(state: Dict[str, Any]) -> None:
 
 # MAIN
 
-def main():
+def run():
     # pull db vars from file 
     with open("credentials/db_config.json", "r", encoding="utf-8") as f:
         db_config = json.load(f)
@@ -325,8 +565,8 @@ def main():
         print("DB connection error:", db.con_err)
         return
 
-    ensure_schema(db)
-
+    ensure_schema_main(db)
+    ensure_database(db)
 
 
     state = load_state()
@@ -373,6 +613,14 @@ def main():
     print("DONE. State:", state)
 
     db.close_connection()
+
+
+
+
+
+def main():
+    run()
+
 
 
 if __name__ == "__main__":

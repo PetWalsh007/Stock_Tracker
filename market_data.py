@@ -1,5 +1,6 @@
 import yfinance as yf
-
+from datetime import datetime
+from typing import List, Dict
 
 class MarketDataError(Exception):
     pass
@@ -59,18 +60,18 @@ def get_fx_rate(from_currency: str, to_currency: str) -> float:
     try:
         ticker = yf.Ticker(pair)
 
-        # 1️⃣ Try fast_info
+        
         fast = ticker.fast_info
         if fast and fast.get("last_price") is not None:
             return float(fast["last_price"])
 
-        # 2️⃣ Fallback: info
+        
         info = ticker.info
         rate = info.get("regularMarketPrice")
         if rate is not None:
             return float(rate)
 
-        # 3️⃣ Last resort: daily close
+       
         hist = ticker.history(period="1d")
         if not hist.empty:
             return float(hist["Close"].iloc[-1])
@@ -89,17 +90,28 @@ def is_etf(symbol: str) -> bool:
     info = t.get_info()
     return info.get("quoteType") == "ETF"
 
-def get_split_data(symbol: str, date: str = "") -> dict:
-    """
-    Get split data for a given ticker symbol.
-    
-    """
-    t = yf.Ticker(symbol)
-    splits = t.splits  
 
-    if date != "":
-        # Filter splits for splits after or on the given date
+def get_split_data(symbol: str, date: str = "") -> List[Dict[str, float]]:
+    """
+    Returns split events as a list of dicts:
+    [{"date": "YYYY-MM-DD", "factor": float}, ...]
+    """
+
+    t = yf.Ticker(symbol)
+    splits = t.splits  # pandas Series
+
+    if splits is None or splits.empty:
+        return []
+
+    # Optional filter
+    if date:
         splits = splits[splits.index >= date]
 
-    return splits
+    out = []
+    for split_date, factor in splits.items():
+        out.append({
+            "date": split_date.strftime("%Y-%m-%d"),
+            "factor": float(factor)
+        })
 
+    return out

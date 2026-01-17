@@ -1,21 +1,23 @@
 """
-Simple Trading212 CSV Viewer (Tkinter) for testing purposes.
+Simple Trading212 Postgres Viewer (Tkinter) for testing purposes.
+- Connects to Postgres
+- Runs a SELECT with optional ticker filter and limit
+- Shows results in a Treeview
 
-
+Requires:
+  pip install psycopg[binary]
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, messagebox
 from datetime import datetime
 
-
-
-from file_import import ingest_trading212_csv as ingest_trading212_csv
-
+import psycopg
+from psycopg.rows import dict_row
 
 
 # =========================
-# 2) TKINTER UI
+# 1) TABLE CONFIG
 # =========================
 COLUMNS = [
     ("time", "Time"),
@@ -30,6 +32,11 @@ COLUMNS = [
     ("total_currency", "Tot Ccy"),
     ("id", "ID"),
 ]
+
+# If your DB column names differ, map UI keys -> DB column names here.
+# Example: if db column is "price" but UI expects "price_per_share": {"price_per_share": "price"}
+DB_COLUMNS_MAP = {k: k for k, _ in COLUMNS}
+
 
 def fmt_dt(x):
     if isinstance(x, datetime):
@@ -51,38 +58,68 @@ def safe_str(x):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Trading212 CSV Viewer (Buys/Sells only)")
-        self.geometry("1200x650")
+        self.title("Trading212 Postgres Viewer (Buys/Sells only)")
+        self.geometry("1280x720")
 
-        self.csv_path = tk.StringVar(value="")
-        self.status = tk.StringVar(value="Pick a CSV to begin.")
+        self.status = tk.StringVar(value="Enter DB details and click Connect + Load.")
         self.loaded_rows: list[dict] = []
+
+        # Connection fields
+        self.pg_host = tk.StringVar(value="localhost")
+        self.pg_port = tk.StringVar(value="5432")
+        self.pg_db   = tk.StringVar(value="postgres")
+        self.pg_user = tk.StringVar(value="postgres")
+        self.pg_pass = tk.StringVar(value="")
+
+        # Source table fields
+        self.pg_schema = tk.StringVar(value="public")
+        self.pg_table  = tk.StringVar(value="trading212_trades")
+
+        # Filters
+        self.ticker_filter = tk.StringVar(value="")  # empty = all
+        self.row_limit = tk.IntVar(value=500)
 
         self._build_ui()
 
     def _build_ui(self):
-        # Top controls
-        top = ttk.Frame(self, padding=10)
-        top.pack(fill="x")
+        # --- Connection row
+        conn = ttk.LabelFrame(self, text="Postgres Connection", padding=10)
+        conn.pack(fill="x", padx=10, pady=(10, 6))
 
-        ttk.Label(top, text="CSV File:").pack(side="left")
-        ttk.Entry(top, textvariable=self.csv_path, width=80).pack(side="left", padx=8)
-        ttk.Button(top, text="Browse…", command=self.browse_file).pack(side="left")
-        ttk.Button(top, text="Load", command=self.load_file).pack(side="left", padx=8)
+        def add_labeled(entry_parent, label, var, width=16, show=None):
+            ttk.Label(entry_parent, text=label).pack(side="left", padx=(0, 6))
+            ttk.Entry(entry_parent, textvariable=var, width=width, show=show).pack(side="left", padx=(0, 12))
 
-        # Filters + stats
-        mid = ttk.Frame(self, padding=(10, 0, 10, 10))
-        mid.pack(fill="x")
+        add_labeled(conn, "Host", self.pg_host, width=16)
+        add_labeled(conn, "Port", self.pg_port, width=6)
+        add_labeled(conn, "DB", self.pg_db, width=16)
+        add_labeled(conn, "User", self.pg_user, width=14)
+        add_labeled(conn, "Password", self.pg_pass, width=14, show="*")
 
-        self.ticker_filter = tk.StringVar(value="")  # empty = all
-        ttk.Label(mid, text="Ticker filter (optional):").pack(side="left")
-        ttk.Entry(mid, textvariable=self.ticker_filter, width=12).pack(side="left", padx=8)
-        ttk.Button(mid, text="Apply Filter", command=self.apply_filter).pack(side="left")
+        ttk.Button(conn, text="Connect + Load", command=self.load_from_db).pack(side="left", padx=8)
 
-        self.stats_label = ttk.Label(mid, text="")
+        # --- Query options
+        opts = ttk.LabelFrame(self, text="Query Options", padding=10)
+        opts.pack(fill="x", padx=10, pady=(0, 10))
+
+        ttk.Label(opts, text="Schema").pack(side="left")
+        ttk.Entry(opts, textvariable=self.pg_schema, width=12).pack(side="left", padx=8)
+
+        ttk.Label(opts, text="Table").pack(side="left")
+        ttk.Entry(opts, textvariable=self.pg_table, width=22).pack(side="left", padx=8)
+
+        ttk.Label(opts, text="Ticker filter (optional)").pack(side="left", padx=(18, 0))
+        ttk.Entry(opts, textvariable=self.ticker_filter, width=12).pack(side="left", padx=8)
+
+        ttk.Label(opts, text="Limit").pack(side="left", padx=(18, 0))
+        ttk.Entry(opts, textvariable=self.row_limit, width=8).pack(side="left", padx=8)
+
+        ttk.Button(opts, text="Reload", command=self.load_from_db).pack(side="left", padx=8)
+
+        self.stats_label = ttk.Label(opts, text="")
         self.stats_label.pack(side="left", padx=16)
 
-        # Table (Treeview)
+        # --- Table
         table_frame = ttk.Frame(self, padding=10)
         table_frame.pack(fill="both", expand=True)
 
@@ -93,7 +130,6 @@ class App(tk.Tk):
             height=20
         )
 
-        # Scrollbars
         vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -105,68 +141,116 @@ class App(tk.Tk):
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
 
-        # Setup headings and default column widths
         for key, title in COLUMNS:
             self.tree.heading(key, text=title)
-            # rough widths
             if key in {"time"}:
                 self.tree.column(key, width=160, anchor="w")
             elif key in {"id"}:
                 self.tree.column(key, width=140, anchor="w")
             elif key in {"ticker", "action_type", "order_type", "price_currency", "total_currency"}:
-                self.tree.column(key, width=80, anchor="center")
+                self.tree.column(key, width=90, anchor="center")
             else:
-                self.tree.column(key, width=100, anchor="e")
+                self.tree.column(key, width=110, anchor="e")
 
-        # Status bar
+        # --- Status
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
         ttk.Label(bottom, textvariable=self.status).pack(side="left")
 
-    def browse_file(self):
-        path = filedialog.askopenfilename(
-            title="Select Trading212 CSV",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+    def _dsn(self) -> str:
+        # psycopg supports a conninfo string; keep it simple.
+        # If password is empty, it will still try (peer/trust/etc. depending on your setup).
+        return (
+            f"host={self.pg_host.get().strip()} "
+            f"port={self.pg_port.get().strip()} "
+            f"dbname={self.pg_db.get().strip()} "
+            f"user={self.pg_user.get().strip()} "
+            f"password={self.pg_pass.get()}"
         )
-        if path:
-            self.csv_path.set(path)
 
-    def load_file(self):
-        path = self.csv_path.get().strip()
-        if not path:
-            messagebox.showwarning("No file", "Please select a CSV file first.")
+    def load_from_db(self):
+        schema = self.pg_schema.get().strip() or "public"
+        table = self.pg_table.get().strip()
+        if not table:
+            messagebox.showwarning("Missing table", "Please enter a table name.")
             return
 
         try:
-            rows = ingest_trading212_csv(path)
-        except Exception as e:
-            messagebox.showerror("Load failed", str(e))
+            limit = int(self.row_limit.get())
+            if limit <= 0:
+                raise ValueError()
+        except Exception:
+            messagebox.showwarning("Bad limit", "Limit must be a positive integer.")
             return
 
-        self.loaded_rows = rows
-        self.status.set(f"Loaded {len(rows)} trade rows (Market/Limit buys & sells).")
-        self._update_stats(rows)
-        self._populate_table(rows[:5000])  # preview first 500 to keep UI snappy
+        ticker = self.ticker_filter.get().strip().upper()
 
-    def apply_filter(self):
-        if not self.loaded_rows:
+        # Build SELECT list safely (identifiers must be composed, not parametrized).
+        # We'll keep it simple: validate identifiers are basic [a-zA-Z0-9_].
+        def is_safe_ident(s: str) -> bool:
+            return s.replace("_", "").isalnum()
+
+        if not is_safe_ident(schema) or not is_safe_ident(table):
+            messagebox.showerror("Unsafe identifier", "Schema/table must be alphanumeric/underscore only.")
             return
 
-        t = self.ticker_filter.get().strip().upper()
-        if not t:
-            filtered = self.loaded_rows
+        db_cols = [DB_COLUMNS_MAP[k] for k, _ in COLUMNS]
+        for c in db_cols:
+            if not is_safe_ident(c):
+                messagebox.showerror("Unsafe column", f"Column name not safe: {c}")
+                return
+
+        select_cols_sql = ", ".join([f'"{c}"' for c in db_cols])
+        from_sql = f'"{schema}"."{table}"'
+
+        where_sql = ""
+        params = {}
+
+        # Optional ticker filter
+        if ticker:
+            where_sql = 'WHERE UPPER("ticker") = %(ticker)s'
+            params["ticker"] = ticker
+
+        # Optional: only buys/sells (matches your original)
+        # If you want *everything*, delete this block.
+        if where_sql:
+            where_sql += ' AND "action_type" IN (\'BUY\', \'SELL\')'
         else:
-            filtered = [r for r in self.loaded_rows if (r.get("ticker") or "").upper() == t]
+            where_sql = 'WHERE "action_type" IN (\'BUY\', \'SELL\')'
 
-        self._update_stats(filtered)
-        self._populate_table(filtered[:500])
-        self.status.set(
-            f"Showing {min(500, len(filtered))} of {len(filtered)} rows"
-            + (f" (filtered: {t})" if t else "")
-        )
+        sql = f"""
+            SELECT {select_cols_sql}
+            FROM {from_sql}
+            {where_sql}
+            ORDER BY "time" DESC
+            LIMIT %(limit)s
+        """
+        params["limit"] = limit
+
+        try:
+            with psycopg.connect(self._dsn(), row_factory=dict_row) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+        except Exception as e:
+            messagebox.showerror("DB load failed", str(e))
+            return
+
+        # Normalize keys to your UI keys (in case DB_COLUMNS_MAP changes)
+        normalized = []
+        for r in rows:
+            item = {}
+            for ui_key, _ in COLUMNS:
+                db_key = DB_COLUMNS_MAP[ui_key]
+                item[ui_key] = r.get(db_key)
+            normalized.append(item)
+
+        self.loaded_rows = normalized
+        self._update_stats(normalized)
+        self._populate_table(normalized)
+        self.status.set(f"Loaded {len(normalized)} rows from {schema}.{table} (limit {limit}).")
 
     def _populate_table(self, rows: list[dict]):
-        # clear
         for item in self.tree.get_children():
             self.tree.delete(item)
 
@@ -174,7 +258,6 @@ class App(tk.Tk):
             vals = []
             for key, _ in COLUMNS:
                 v = r.get(key)
-
                 if key == "time":
                     vals.append(fmt_dt(v))
                 elif key in {"shares"}:
@@ -187,7 +270,6 @@ class App(tk.Tk):
                     vals.append(fmt_num(v, dp=2))
                 else:
                     vals.append(safe_str(v))
-
             self.tree.insert("", "end", values=vals)
 
     def _update_stats(self, rows: list[dict]):
